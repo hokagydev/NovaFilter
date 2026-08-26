@@ -38,6 +38,8 @@ public class VelocityGuard {
     
     // Сессия проверенных игроков в памяти
     private final Set<UUID> verifiedPlayers = ConcurrentHashMap.newKeySet();
+    // Игроки, которым уже отправлено сообщение (чтобы не спамить в чат)[cite: 1]
+    private final Set<UUID> notifiedPlayers = ConcurrentHashMap.newKeySet();
     
     // Настройки URL твоего сайта
     private final String webAuthUrl = "https://captcha.novamine.fun/verify?nick=";
@@ -52,9 +54,15 @@ public class VelocityGuard {
 
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
-        logger.info("VelocityGuard (v4.x / Java 21) успешно запущен!");
+        logger.info("==================================================");
+        logger.info(" VelocityGuard успешно запущен (Java 21 / v4.x)!");
+        logger.info(" Целевой домен капчи: https://captcha.novamine.fun");
+        logger.info("==================================================");
         
-        // Фоновый таск проверки статуса верификации
+        // Тестируем соединение с сайтом при запуске в отдельном потоке
+        server.getScheduler().buildTask(this, this::testWebsiteConnection).schedule();
+
+        // Фоновый таск проверки статуса верификации игроков
         server.getScheduler().buildTask(this, this::checkPendingPlayers)
                 .repeat(3, TimeUnit.SECONDS)
                 .schedule();
@@ -65,16 +73,39 @@ public class VelocityGuard {
         Player player = event.getPlayer();
         
         if (!verifiedPlayers.contains(player.getUniqueId())) {
-            server.getScheduler().buildTask(this, () -> sendVerificationMessage(player))
-                    .delay(1, TimeUnit.SECONDS)
-                    .schedule();
+            server.getScheduler().buildTask(this, () -> {
+                sendVerificationMessage(player);
+                notifiedPlayers.add(player.getUniqueId());
+            }).delay(1, TimeUnit.SECONDS).schedule();
         }
     }
 
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
-        // Очищать ли статус при выходе:
-        // verifiedPlayers.remove(event.getPlayer().getUniqueId());
+        UUID uuid = event.getPlayer().getUniqueId();
+        notifiedPlayers.remove(uuid);
+        // Если нужно сбрасывать верификацию при выходе игрока, раскомментируй строку ниже:
+        // verifiedPlayers.remove(uuid);
+    }
+
+    private void testWebsiteConnection() {
+        try {
+            logger.info("[VelocityGuard] Выполняется проверка подключения к сайту капчи...");
+            URL url = URI.create("https://captcha.novamine.fun").toURL();
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(4000);
+            
+            int responseCode = conn.getResponseCode();
+            if (responseCode >= 200 && responseCode < 400) {
+                logger.info("[VelocityGuard] Подключение к сайту успешно! Код ответа: " + responseCode);
+            } else {
+                logger.warn("[VelocityGuard] ВНИМАНИЕ: Сайт ответил с ошибкой, код: " + responseCode);
+            }
+        } catch (Exception e) {
+            logger.error("[VelocityGuard] ОШИБКА: Не удалось подключиться к сайту captcha.novamine.fun! Проверьте интернет или доступность домена. Причина: " + e.getMessage());
+        }
     }
 
     private void sendVerificationMessage(Player player) {
@@ -96,18 +127,24 @@ public class VelocityGuard {
                 continue;
             }
 
-            // Асинхронный запрос к сайту
+            // Асинхронный запрос к сайту для проверки прохождения капчи
             server.getScheduler().buildTask(this, () -> {
                 if (isVerifiedOnWeb(player.getUsername())) {
                     verifiedPlayers.add(player.getUniqueId());
+                    notifiedPlayers.remove(player.getUniqueId());
                     
                     player.sendMessage(Component.text("[!] Капча успешно пройдена! Подключаем к серверу...", NamedTextColor.GREEN));
+                    logger.info("[VelocityGuard] Игрок " + player.getUsername() + " успешно прошёл капчу и подключен к серверу " + targetServerName);
                     
                     server.getServer(targetServerName).ifPresent(target -> {
                         player.createConnectionRequest(target).fireAndForget();
                     });
                 } else {
-                    sendVerificationMessage(player);
+                    // Если игрок зашел, но еще не получил уведомление (на всякий случай)
+                    if (!notifiedPlayers.contains(player.getUniqueId())) {
+                        sendVerificationMessage(player);
+                        notifiedPlayers.add(player.getUniqueId());
+                    }
                 }
             }).schedule();
         }
@@ -128,7 +165,7 @@ public class VelocityGuard {
                 }
             }
         } catch (Exception e) {
-            // Ошибка подключения к бэкенду сайта
+            // Ошибка подключения к бэкенду сайта при проверке игрока
         }
         return false;
     }
